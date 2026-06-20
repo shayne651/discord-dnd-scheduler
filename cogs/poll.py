@@ -13,6 +13,7 @@ Architecture notes:
 import asyncio
 import json
 import random
+from datetime import date, timedelta
 
 import discord
 from discord.ext import commands
@@ -20,7 +21,7 @@ from discord.ext import commands
 import database as db
 from utils.dates import (
     day_int_to_name, day_int_to_short,
-    next_session_date, week_start_str,
+    week_start_str,
     date_for_day_this_week, friendly_date,
     compute_session_start, build_event_datetimes, minutes_to_time_str,
 )
@@ -50,6 +51,8 @@ def _tb_lock(tb_id: int = 1) -> asyncio.Lock:
 
 def _player_display(uid: str, guild: discord.Guild, nicknames: dict[str, str]) -> str:
     """Discord name, with character name in italics if set. e.g. 'Shayne *(Gandalf)*'"""
+    if uid == "campaign":
+        return "🛑 *(campaign setting)*"
     member = guild.get_member(int(uid))
     discord_name = member.display_name if member else f"<@{uid}>"
     char = nicknames.get(str(uid))
@@ -74,7 +77,9 @@ def build_poll_embed(
     if cfg_row:
         day_name = day_int_to_name(cfg_row.get("session_day", 5))
         time_str = cfg_row.get("session_time")
-        session_info = f"Regular session: **{day_name}s**" + (f" at **{time_str}**" if time_str else "")
+        recurrence_weeks = int(cfg_row.get("recurrence_weeks") or 1)
+        cadence = f" (every {recurrence_weeks} weeks)" if recurrence_weeks > 1 else ""
+        session_info = f"Regular session: **{day_name}s**{cadence}" + (f" at **{time_str}**" if time_str else "")
 
     embed = discord.Embed(
         title=poll_title(week),
@@ -140,6 +145,71 @@ def build_tiebreaker_embed(
         )
     embed.set_footer(text="Vote for your preferred day. Highest count wins.")
     return embed
+
+
+# ── Auto-schedule helpers ─────────────────────────────────────────────────────
+# Shared between the /init wizard, the recurring scheduler, and poll resolution
+# so a "session" only ever gets created in one place.
+
+async def create_scheduled_event_for_day(
+    guild: discord.Guild,
+    day: int,
+    event_date: date,
+    cfg_row: dict,
+    start_mins: int | None = None,
+) -> discord.ScheduledEvent | None:
+    """Create a Discord Scheduled Event for `day` on `event_date` using the configured voice channel."""
+    voice_channel_id = cfg_row.get("voice_channel_id")
+    if not voice_channel_id:
+        print("[Bot] Skipping event creation: no voice channel configured (run /setvoicechannel)")
+        return None
+
+    voice_channel = guild.get_channel(int(voice_channel_id))
+    if not voice_channel:
+        print(f"[Bot] Skipping event creation: voice channel {voice_channel_id} not found in guild")
+        return None
+
+    week_start_iso = week_start_str(event_date)
+    start_dt, end_dt = build_event_datetimes(day, week_start_iso, start_mins, cfg_row)
+
+    print(f"[Bot] Creating scheduled event: {day_int_to_name(day)} {start_dt} → {end_dt} in #{voice_channel.name}")
+    try:
+        event = await guild.create_scheduled_event(
+            name="D&D Session",
+            description=f"Scheduled session for {friendly_date(event_date)}.",
+            start_time=start_dt,
+            end_time=end_dt,
+            location=voice_channel,
+        )
+        print(f"[Bot] Event created: {event.url}")
+        return event
+    except discord.Forbidden as e:
+        print(f"[Bot] Event creation forbidden — bot needs Manage Events permission: {e}")
+    except discord.HTTPException as e:
+        print(f"[Bot] Event creation failed (HTTP {e.status}): {e.text}")
+    return None
+
+
+async def cancel_event(guild: discord.Guild, event_id: str | None) -> None:
+    """Best-effort delete of a previously created Discord Scheduled Event."""
+    if not event_id:
+        return
+    try:
+        event = guild.get_scheduled_event(int(event_id)) or await guild.fetch_scheduled_event(int(event_id))
+        if event:
+            await event.delete()
+    except (discord.NotFound, discord.HTTPException, ValueError):
+        pass
+
+
+async def supersede_auto_schedule(guild: discord.Guild, cfg_row: dict) -> None:
+    """
+    Cancel any auto-scheduled event for the upcoming cycle and clear cycle tracking,
+    since a poll is about to decide this cycle instead. Called right before a fresh
+    poll is opened (via /cantmake or /startpoll).
+    """
+    await cancel_event(guild, cfg_row.get("current_event_id"))
+    db.upsert_config(guild.id, current_event_id=None, next_cycle_date=None)
 
 
 # ── Poll View ─────────────────────────────────────────────────────────────────
@@ -253,6 +323,9 @@ async def _handle_vote(interaction: discord.Interaction, day: int):
         if day in blocked_days:
             blocker_names = []
             for uid in blocked_days[day]:
+                if uid == "campaign":
+                    blocker_names.append("the campaign schedule")
+                    continue
                 m = interaction.guild.get_member(int(uid))
                 blocker_names.append(m.display_name if m else f"<@{uid}>")
             await interaction.response.send_message(
@@ -359,31 +432,23 @@ async def _close_poll_winner(interaction: discord.Interaction, day: int, poll: d
     time_str = f" at {minutes_to_time_str(display_mins)}"
     label = f"{day_name} ({friendly_date(day_date)}){time_str}"
 
-    # Create the Discord Scheduled Event first so we can include its URL in the announcement
-    event_url: str | None = None
-    voice_channel_id = (cfg_row or {}).get("voice_channel_id")
-    if not voice_channel_id:
-        print("[Bot] Skipping event creation: no voice channel configured (run /setvoicechannel)")
-    else:
-        voice_channel = interaction.guild.get_channel(int(voice_channel_id))
-        if not voice_channel:
-            print(f"[Bot] Skipping event creation: voice channel {voice_channel_id} not found in guild")
-        else:
-            print(f"[Bot] Creating scheduled event: {day_name} {start_dt} → {end_dt} in #{voice_channel.name}")
-            try:
-                event = await interaction.guild.create_scheduled_event(
-                    name="D&D Session",
-                    description=f"Scheduled session for the week of {poll['week_start']}.",
-                    start_time=start_dt,
-                    end_time=end_dt,
-                    location=voice_channel,
-                )
-                event_url = event.url if event else None
-                print(f"[Bot] Event created: {event_url or 'no URL'}")
-            except discord.Forbidden as e:
-                print(f"[Bot] Event creation forbidden — bot needs Manage Events permission: {e}")
-            except discord.HTTPException as e:
-                print(f"[Bot] Event creation failed (HTTP {e.status}): {e.text}")
+    # Cancel any event the auto-scheduler already created for this cycle before
+    # creating the real one for the winning day (they may differ).
+    await cancel_event(interaction.guild, (cfg_row or {}).get("current_event_id"))
+
+    event = await create_scheduled_event_for_day(interaction.guild, day, day_date, cfg_row or {}, start_mins)
+    event_url = event.url if event else None
+
+    # The winning day becomes the new default — future cycles auto-schedule on it
+    # unless overridden again via /cantmake. Queue up the next cycle per cadence.
+    recurrence_weeks = int((cfg_row or {}).get("recurrence_weeks") or 1)
+    next_cycle_date = day_date + timedelta(weeks=recurrence_weeks)
+    db.upsert_config(
+        interaction.guild_id,
+        session_day=day,
+        current_event_id=event.id if event else None,
+        next_cycle_date=next_cycle_date.isoformat(),
+    )
 
     poll_channel_id = (cfg_row or {}).get("poll_channel_id")
     if poll_channel_id:
@@ -442,7 +507,12 @@ async def _confirm_no_days(interaction: discord.Interaction):
         session_day = cfg_row["session_day"] if cfg_row else 5
         db.record_history(poll["week_start"], session_day, cancelled=True, reason="no_days")
 
-        next_date = next_session_date(session_day)
+        # Queue up the next cycle per cadence, anchored to the cancelled cycle's date
+        # (not "today") so a biweekly campaign doesn't drift to weekly.
+        recurrence_weeks = int((cfg_row or {}).get("recurrence_weeks") or 1)
+        cancelled_session_date = date.fromisoformat(poll["week_start"]) + timedelta(days=session_day)
+        next_date = cancelled_session_date + timedelta(weeks=recurrence_weeks)
+        db.upsert_config(interaction.guild_id, current_event_id=None, next_cycle_date=next_date.isoformat())
 
         poll_channel_id = cfg_row.get("poll_channel_id") if cfg_row else None
         if poll_channel_id:

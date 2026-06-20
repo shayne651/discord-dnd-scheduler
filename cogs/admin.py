@@ -22,7 +22,10 @@ from utils.dates import day_int_to_name, next_session_date, week_start_str
 from utils.messages import (
     resetpoll_done, wipe_confirm_prompt, wipe_done, wipe_role_error, schedule_set
 )
-from cogs.poll import post_new_poll
+from cogs.poll import (
+    post_new_poll, refresh_poll_message, supersede_auto_schedule,
+    create_scheduled_event_for_day, cancel_event,
+)
 
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -55,6 +58,9 @@ class WipeConfirmView(discord.ui.View):
 
         cfg_row = db.get_config()
         role_errors: list[str] = []
+
+        # ── Cancel any pending auto-scheduled event ───────────────────────────
+        await cancel_event(interaction.guild, (cfg_row or {}).get("current_event_id"))
 
         # ── Delete active Discord poll messages ───────────────────────────────
         for get_fn, msg_key, ch_key in [
@@ -177,7 +183,23 @@ class AdminCog(commands.Cog):
 
         day_int = DAYS.index(day)
         db.upsert_config(ctx.guild_id, session_day=day_int)
-        await ctx.respond(f"✅ Regular session day updated to **{day}**.", ephemeral=True)
+
+        # If there's a pending auto-scheduled cycle (and no open poll deciding it),
+        # move it to the new day so the next event actually lands on the new default.
+        cfg_row = db.get_config()
+        note = ""
+        if cfg_row and cfg_row.get("next_cycle_date") and not db.get_open_poll():
+            await cancel_event(ctx.guild, cfg_row.get("current_event_id"))
+            target_date = next_session_date(day_int)
+            event = await create_scheduled_event_for_day(ctx.guild, day_int, target_date, cfg_row)
+            db.upsert_config(
+                ctx.guild_id,
+                current_event_id=event.id if event else None,
+                next_cycle_date=target_date.isoformat(),
+            )
+            note = " The upcoming auto-scheduled event has been moved to match."
+
+        await ctx.respond(f"✅ Regular session day updated to **{day}**.{note}", ephemeral=True)
 
     # ── /setchannel ───────────────────────────────────────────────────────────
 
@@ -258,6 +280,25 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
+    # ── /setdmprivatevoice ────────────────────────────────────────────────────
+
+    @discord.slash_command(
+        name="setdmprivatevoice",
+        description="[DM] Set the private voice channel for pulling players aside, invisible to PCs.",
+    )
+    @option("channel", description="The voice channel to use", type=discord.VoiceChannel)
+    async def setdmprivatevoice(self, ctx: discord.ApplicationContext, channel: discord.VoiceChannel):
+        if not _has_dm_role(ctx):
+            await ctx.respond("❌ Only the DM can use this command.", ephemeral=True)
+            return
+        db.upsert_config(ctx.guild_id, dm_private_voice_channel_id=channel.id)
+        await ctx.respond(
+            f"✅ DM private voice channel set to **{channel.name}**. "
+            "Make sure PCs don't have **View Channel**/**Connect** on it — "
+            "you can still drag them in manually with **Move Members**.",
+            ephemeral=True,
+        )
+
     # ── /settimezone ──────────────────────────────────────────────────────────
 
     @discord.slash_command(
@@ -312,6 +353,79 @@ class AdminCog(commands.Cog):
         db.upsert_config(ctx.guild_id, min_session_hours=h)
         await ctx.respond(f"✅ Minimum session duration set to **{h} hour(s)**.", ephemeral=True)
 
+    # ── /setrecurrence ────────────────────────────────────────────────────────
+
+    @discord.slash_command(
+        name="setrecurrence",
+        description="[DM] Set how often (in weeks) the campaign repeats.",
+    )
+    @option("weeks", description="e.g. 1 for weekly, 2 for every other week", type=int)
+    async def setrecurrence(self, ctx: discord.ApplicationContext, weeks: int):
+        if not _has_dm_role(ctx):
+            await ctx.respond("❌ Only the DM can use this command.", ephemeral=True)
+            return
+        if weeks < 1:
+            await ctx.respond("❌ Recurrence must be 1 week or more.", ephemeral=True)
+            return
+
+        db.upsert_config(ctx.guild_id, recurrence_weeks=weeks)
+        cadence = "every week" if weeks == 1 else f"every {weeks} weeks"
+        await ctx.respond(
+            f"✅ Campaign cadence set to **{cadence}**. This takes effect starting the next cycle.",
+            ephemeral=True,
+        )
+
+    # ── /blockcampaignday ─────────────────────────────────────────────────────
+
+    @discord.slash_command(
+        name="blockcampaignday",
+        description="[DM] Permanently block a day campaign-wide (e.g. the table never plays Fridays).",
+    )
+    @option("day", description="The day to block", choices=DAYS)
+    async def blockcampaignday(self, ctx: discord.ApplicationContext, day: str):
+        if not _has_dm_role(ctx):
+            await ctx.respond("❌ Only the DM can use this command.", ephemeral=True)
+            return
+
+        day_int = DAYS.index(day)
+        added = db.add_campaign_day_block(ctx.guild_id, day_int)
+        if not added:
+            await ctx.respond(f"**{day}** is already campaign-blocked.", ephemeral=True)
+            return
+
+        poll = db.get_open_poll()
+        if poll:
+            db.remove_all_votes_for_day(1, day_int)
+            await refresh_poll_message(ctx.guild, ctx.author.id)
+
+        await ctx.respond(
+            f"🚫 **{day}** is now blocked for the whole campaign and excluded from polls.",
+            ephemeral=True,
+        )
+
+    # ── /unblockcampaignday ───────────────────────────────────────────────────
+
+    @discord.slash_command(
+        name="unblockcampaignday",
+        description="[DM] Remove a campaign-wide day block.",
+    )
+    @option("day", description="The day to unblock", choices=DAYS)
+    async def unblockcampaignday(self, ctx: discord.ApplicationContext, day: str):
+        if not _has_dm_role(ctx):
+            await ctx.respond("❌ Only the DM can use this command.", ephemeral=True)
+            return
+
+        day_int = DAYS.index(day)
+        removed = db.remove_campaign_day_block(ctx.guild_id, day_int)
+        if not removed:
+            await ctx.respond(f"**{day}** isn't campaign-blocked.", ephemeral=True)
+            return
+
+        if db.get_open_poll():
+            await refresh_poll_message(ctx.guild, ctx.author.id)
+
+        await ctx.respond(f"✅ **{day}** is unblocked campaign-wide and will appear in polls again.", ephemeral=True)
+
     # ── /startpoll ────────────────────────────────────────────────────────────
 
     @discord.slash_command(
@@ -328,6 +442,10 @@ class AdminCog(commands.Cog):
         if db.get_open_poll():
             await ctx.respond("There is already an open poll this week.", ephemeral=True)
             return
+
+        cfg_row = db.get_config()
+        if cfg_row and (cfg_row.get("current_event_id") or cfg_row.get("next_cycle_date")):
+            await supersede_auto_schedule(ctx.guild, cfg_row)
 
         week = week_start_str()
         db.create_poll(0, 0, ctx.author.id, week)
@@ -413,9 +531,14 @@ class AdminCog(commands.Cog):
         p_role     = f"<@&{cfg['player_role_id']}>"  if cfg.get("player_role_id")   else "*(not set)*"
         dm_role    = f"<@&{cfg['dm_role_id']}>"      if cfg.get("dm_role_id")       else "*(not set)*"
         voice_ch   = f"<#{cfg['voice_channel_id']}>" if cfg.get("voice_channel_id") else "*(not set)*"
+        dm_private_ch = f"<#{cfg['dm_private_voice_channel_id']}>" if cfg.get("dm_private_voice_channel_id") else "*(not set)*"
         tz_offset  = int(cfg.get("timezone_offset") or 0)
         tz_str     = f"UTC{'+' if tz_offset >= 0 else ''}{tz_offset}"
         duration   = float(cfg.get("min_session_hours") or 2.0)
+
+        recurrence_weeks = int(cfg.get("recurrence_weeks") or 1)
+        cadence_str = "every week" if recurrence_weeks == 1 else f"every {recurrence_weeks} weeks"
+        next_cycle_raw = cfg.get("next_cycle_date")
 
         embed = discord.Embed(title="📋 D&D Bot Status", color=discord.Color.blurple())
         embed.add_field(
@@ -423,21 +546,31 @@ class AdminCog(commands.Cog):
             value=f"{session_day_name}s at {session_time} (next: {next_sess.strftime('%b %-d')})",
             inline=False,
         )
+        embed.add_field(name="Recurrence", value=cadence_str, inline=True)
+        embed.add_field(
+            name="Next auto-scheduled cycle",
+            value=next_cycle_raw if next_cycle_raw else "*(none pending — an open poll may be deciding it)*",
+            inline=True,
+        )
         embed.add_field(name="Poll channel",       value=poll_ch,   inline=True)
         embed.add_field(name="DM notify channel",  value=dm_ch,     inline=True)
         embed.add_field(name="Player role",        value=p_role,    inline=True)
         embed.add_field(name="DM role",            value=dm_role,   inline=True)
         embed.add_field(name="Voice channel",      value=voice_ch,  inline=True)
+        embed.add_field(name="DM private room",    value=dm_private_ch, inline=True)
         embed.add_field(name="Timezone",           value=tz_str,    inline=True)
         embed.add_field(name="Min session length", value=f"{duration}h", inline=True)
 
-        # Day blocks
+        # Day blocks (campaign-wide + per-player, merged by db.get_blocked_days_for_guild)
         blocked = db.get_blocked_days_for_guild(ctx.guild_id)
         if blocked:
             lines = []
             for day_int, uids in sorted(blocked.items()):
                 names = []
                 for uid in uids:
+                    if uid == "campaign":
+                        names.append("*(campaign-wide)*")
+                        continue
                     m = ctx.guild.get_member(int(uid))
                     names.append(m.display_name if m else f"<@{uid}>")
                 lines.append(f"**{day_int_to_name(day_int)}**: {', '.join(names)}")

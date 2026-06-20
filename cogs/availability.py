@@ -27,7 +27,7 @@ from utils.messages import (
     blockday_poll_updated,
     nick_set,
 )
-from cogs.poll import post_new_poll, refresh_poll_message, check_consensus
+from cogs.poll import post_new_poll, refresh_poll_message, check_consensus, supersede_auto_schedule
 
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -51,7 +51,7 @@ class DayPickerView(discord.ui.View):
         super().__init__(timeout=120)
         self.user_id = user_id
         self.selected: set[int] = set()
-        self._user_blocks = set(db.get_user_day_blocks(guild_id, user_id))
+        self._user_blocks = set(db.get_user_day_blocks(guild_id, user_id)) | set(db.get_campaign_blocked_days(guild_id))
         self._guild_id = guild_id
         self._rebuild_buttons()
 
@@ -242,6 +242,10 @@ async def _process_cantmake(
             blocked_days = db.get_blocked_days_for_guild(interaction.guild_id)
             await check_consensus(interaction, poll, votes, blocked_days)
     else:
+        cfg_row = db.get_config()
+        if cfg_row and (cfg_row.get("current_event_id") or cfg_row.get("next_cycle_date")):
+            await supersede_auto_schedule(interaction.guild, cfg_row)
+
         db.create_poll(0, 0, interaction.user.id, week)
         db.upsert_cant_make(1, interaction.user.id, available_days)
         if windows:

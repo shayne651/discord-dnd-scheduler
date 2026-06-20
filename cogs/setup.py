@@ -14,14 +14,15 @@ Flow:
 """
 
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from discord.ext import commands
 
 import config
 import database as db
-from utils.dates import DAY_NAMES
+from utils.dates import DAY_NAMES, next_session_date, week_start_str
+from cogs.poll import create_scheduled_event_for_day, post_new_poll
 
 
 def _is_initialized() -> bool:
@@ -39,7 +40,9 @@ def _welcome_embed() -> discord.Embed:
             "**1.** Set up **DM** and **PC** roles\n"
             "**2.** Assign those roles to your players\n"
             "**3.** Create a **D&D category** with text and voice channels\n"
-            "**4.** Configure your **session schedule** and timezone\n\n"
+            "**4.** Configure your **session schedule** and timezone — pick a fixed day "
+            "(an event gets created immediately) or type `poll` to vote on the first session now\n"
+            "**5.** Set your **recurrence** (e.g. every 2 weeks) and any **always-blocked days**\n\n"
             "You can change anything later with individual `/set…` commands."
         ),
         color=discord.Color.gold(),
@@ -228,8 +231,8 @@ class ScheduleConfigModal(discord.ui.Modal):
         self.pc_user_ids = pc_user_ids
 
         self.add_item(discord.ui.InputText(
-            label="Session day",
-            placeholder="e.g. Saturday",
+            label="Session day  (or type 'poll')",
+            placeholder="e.g. Saturday — or 'poll' to vote on the first session now",
             value="Saturday",
             max_length=20,
         ))
@@ -260,7 +263,8 @@ class ScheduleConfigModal(discord.ui.Modal):
         tz_raw   = (self.children[2].value or "").strip().lower()
         dur_raw  = self.children[3].value.strip()
 
-        day_int = next(
+        is_poll_mode = day_raw.lower() == "poll"
+        day_int = None if is_poll_mode else next(
             (i for i, d in enumerate(DAY_NAMES) if d.lower().startswith(day_raw.lower())),
             5,
         )
@@ -278,13 +282,14 @@ class ScheduleConfigModal(discord.ui.Modal):
         except ValueError:
             min_hours = 2.0
 
-        view = ChannelConfigView(
+        view = RecurrenceConfigView(
             ctx=self.ctx,
             create_roles=self.create_roles,
             dm_role_id=self.dm_role_id,
             pc_role_id=self.pc_role_id,
             dm_user_ids=self.dm_user_ids,
             pc_user_ids=self.pc_user_ids,
+            is_poll_mode=is_poll_mode,
             session_day=day_int,
             session_time=time_raw,
             timezone_offset=tz_offset,
@@ -293,21 +298,21 @@ class ScheduleConfigModal(discord.ui.Modal):
         try:
             await self.ctx.edit(
                 content=(
-                    "**📋 Step 4 — Channels**\n"
-                    "Configure the category and channels that will be created for your campaign."
+                    "**🔁 Step 4 — Recurrence & Blocked Days**\n"
+                    "Set how often the campaign repeats and any days that are always off the table."
                 ),
                 embed=None,
                 view=view,
             )
         except Exception:
             await interaction.followup.send(
-                "Something went wrong moving to the channel step.", ephemeral=True
+                "Something went wrong moving to the recurrence step.", ephemeral=True
             )
 
 
-# ── Step 4: Channel config view + modal ───────────────────────────────────────
+# ── Step 4: Recurrence & blocked days view + modal ────────────────────────────
 
-class ChannelConfigView(discord.ui.View):
+class RecurrenceConfigView(discord.ui.View):
     def __init__(
         self,
         ctx: discord.ApplicationContext,
@@ -316,7 +321,8 @@ class ChannelConfigView(discord.ui.View):
         pc_role_id: int | None,
         dm_user_ids: list[int],
         pc_user_ids: list[int],
-        session_day: int,
+        is_poll_mode: bool,
+        session_day: int | None,
         session_time: str,
         timezone_offset: int,
         min_session_hours: float,
@@ -328,10 +334,159 @@ class ChannelConfigView(discord.ui.View):
         self.pc_role_id = pc_role_id
         self.dm_user_ids = dm_user_ids
         self.pc_user_ids = pc_user_ids
+        self.is_poll_mode = is_poll_mode
         self.session_day = session_day
         self.session_time = session_time
         self.timezone_offset = timezone_offset
         self.min_session_hours = min_session_hours
+
+    @discord.ui.button(label="Configure Recurrence →", style=discord.ButtonStyle.primary)
+    async def configure(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            RecurrenceConfigModal(
+                ctx=self.ctx,
+                create_roles=self.create_roles,
+                dm_role_id=self.dm_role_id,
+                pc_role_id=self.pc_role_id,
+                dm_user_ids=self.dm_user_ids,
+                pc_user_ids=self.pc_user_ids,
+                is_poll_mode=self.is_poll_mode,
+                session_day=self.session_day,
+                session_time=self.session_time,
+                timezone_offset=self.timezone_offset,
+                min_session_hours=self.min_session_hours,
+            )
+        )
+        self.stop()
+
+
+class RecurrenceConfigModal(discord.ui.Modal):
+    def __init__(
+        self,
+        ctx: discord.ApplicationContext,
+        create_roles: bool,
+        dm_role_id: int | None,
+        pc_role_id: int | None,
+        dm_user_ids: list[int],
+        pc_user_ids: list[int],
+        is_poll_mode: bool,
+        session_day: int | None,
+        session_time: str,
+        timezone_offset: int,
+        min_session_hours: float,
+    ):
+        super().__init__(title="🔁 Step 4 — Recurrence & Blocks")
+        self.ctx = ctx
+        self.create_roles = create_roles
+        self.dm_role_id = dm_role_id
+        self.pc_role_id = pc_role_id
+        self.dm_user_ids = dm_user_ids
+        self.pc_user_ids = pc_user_ids
+        self.is_poll_mode = is_poll_mode
+        self.session_day = session_day
+        self.session_time = session_time
+        self.timezone_offset = timezone_offset
+        self.min_session_hours = min_session_hours
+
+        self.add_item(discord.ui.InputText(
+            label="Repeat every how many weeks?",
+            placeholder="e.g. 1 for weekly, 2 for every other week",
+            value="1",
+            max_length=3,
+        ))
+        self.add_item(discord.ui.InputText(
+            label="Blocked days — comma separated (optional)",
+            placeholder="e.g. Friday",
+            required=False,
+            max_length=100,
+        ))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        weeks_raw = self.children[0].value.strip()
+        blocked_raw = (self.children[1].value or "").strip()
+
+        try:
+            recurrence_weeks = max(1, int(weeks_raw))
+        except ValueError:
+            recurrence_weeks = 1
+
+        blocked_day_ints: list[int] = []
+        for token in blocked_raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            idx = next(
+                (i for i, d in enumerate(DAY_NAMES) if d.lower().startswith(token.lower())),
+                None,
+            )
+            if idx is not None and idx not in blocked_day_ints:
+                blocked_day_ints.append(idx)
+
+        view = ChannelConfigView(
+            ctx=self.ctx,
+            create_roles=self.create_roles,
+            dm_role_id=self.dm_role_id,
+            pc_role_id=self.pc_role_id,
+            dm_user_ids=self.dm_user_ids,
+            pc_user_ids=self.pc_user_ids,
+            is_poll_mode=self.is_poll_mode,
+            session_day=self.session_day,
+            session_time=self.session_time,
+            timezone_offset=self.timezone_offset,
+            min_session_hours=self.min_session_hours,
+            recurrence_weeks=recurrence_weeks,
+            blocked_day_ints=blocked_day_ints,
+        )
+        try:
+            await self.ctx.edit(
+                content=(
+                    "**📋 Step 5 — Channels**\n"
+                    "Configure the category and channels that will be created for your campaign."
+                ),
+                embed=None,
+                view=view,
+            )
+        except Exception:
+            await interaction.followup.send(
+                "Something went wrong moving to the channel step.", ephemeral=True
+            )
+
+
+# ── Step 5: Channel config view + modal ───────────────────────────────────────
+
+class ChannelConfigView(discord.ui.View):
+    def __init__(
+        self,
+        ctx: discord.ApplicationContext,
+        create_roles: bool,
+        dm_role_id: int | None,
+        pc_role_id: int | None,
+        dm_user_ids: list[int],
+        pc_user_ids: list[int],
+        is_poll_mode: bool,
+        session_day: int | None,
+        session_time: str,
+        timezone_offset: int,
+        min_session_hours: float,
+        recurrence_weeks: int,
+        blocked_day_ints: list[int],
+    ):
+        super().__init__(timeout=600)
+        self.ctx = ctx
+        self.create_roles = create_roles
+        self.dm_role_id = dm_role_id
+        self.pc_role_id = pc_role_id
+        self.dm_user_ids = dm_user_ids
+        self.pc_user_ids = pc_user_ids
+        self.is_poll_mode = is_poll_mode
+        self.session_day = session_day
+        self.session_time = session_time
+        self.timezone_offset = timezone_offset
+        self.min_session_hours = min_session_hours
+        self.recurrence_weeks = recurrence_weeks
+        self.blocked_day_ints = blocked_day_ints
 
     def _modal(self) -> "ChannelConfigModal":
         return ChannelConfigModal(
@@ -341,10 +496,13 @@ class ChannelConfigView(discord.ui.View):
             pc_role_id=self.pc_role_id,
             dm_user_ids=self.dm_user_ids,
             pc_user_ids=self.pc_user_ids,
+            is_poll_mode=self.is_poll_mode,
             session_day=self.session_day,
             session_time=self.session_time,
             timezone_offset=self.timezone_offset,
             min_session_hours=self.min_session_hours,
+            recurrence_weeks=self.recurrence_weeks,
+            blocked_day_ints=self.blocked_day_ints,
         )
 
     @discord.ui.button(label="Configure Channels →", style=discord.ButtonStyle.primary)
@@ -362,22 +520,28 @@ class ChannelConfigModal(discord.ui.Modal):
         pc_role_id: int | None,
         dm_user_ids: list[int],
         pc_user_ids: list[int],
-        session_day: int,
+        is_poll_mode: bool,
+        session_day: int | None,
         session_time: str,
         timezone_offset: int,
         min_session_hours: float,
+        recurrence_weeks: int,
+        blocked_day_ints: list[int],
     ):
-        super().__init__(title="📋 Step 4 — Channels")
+        super().__init__(title="📋 Step 5 — Channels")
         self.ctx = ctx
         self.create_roles = create_roles
         self.dm_role_id = dm_role_id
         self.pc_role_id = pc_role_id
         self.dm_user_ids = dm_user_ids
         self.pc_user_ids = pc_user_ids
+        self.is_poll_mode = is_poll_mode
         self.session_day = session_day
         self.session_time = session_time
         self.timezone_offset = timezone_offset
         self.min_session_hours = min_session_hours
+        self.recurrence_weeks = recurrence_weeks
+        self.blocked_day_ints = blocked_day_ints
 
         default_channels = "\n".join(config.EXTRA_CHANNELS)
 
@@ -409,15 +573,19 @@ class ChannelConfigModal(discord.ui.Modal):
 
         result = await _run_setup(
             guild=interaction.guild,
+            initiated_by=interaction.user.id,
             create_roles=self.create_roles,
             dm_role_id=self.dm_role_id,
             pc_role_id=self.pc_role_id,
             dm_user_ids=self.dm_user_ids,
             pc_user_ids=self.pc_user_ids,
+            is_poll_mode=self.is_poll_mode,
             session_day=self.session_day,
             session_time=self.session_time,
             timezone_offset=self.timezone_offset,
             min_session_hours=self.min_session_hours,
+            recurrence_weeks=self.recurrence_weeks,
+            blocked_day_ints=self.blocked_day_ints,
             category_name=cat_raw,
             extra_channel_names=extra_channel_names,
         )
@@ -432,15 +600,19 @@ class ChannelConfigModal(discord.ui.Modal):
 
 async def _run_setup(
     guild: discord.Guild,
+    initiated_by: int,
     create_roles: bool,
     dm_role_id: int | None,
     pc_role_id: int | None,
     dm_user_ids: list[int],
     pc_user_ids: list[int],
-    session_day: int,
+    is_poll_mode: bool,
+    session_day: int | None,
     session_time: str,
     timezone_offset: int,
     min_session_hours: float,
+    recurrence_weeks: int,
+    blocked_day_ints: list[int],
     category_name: str,
     extra_channel_names: list[str],
 ) -> str:
@@ -496,8 +668,19 @@ async def _run_setup(
             connect=True, speak=True,
         )
 
+    # The DM's private side room is invisible to PCs by default — the DM grants
+    # access (or moves players in) manually, e.g. for a one-on-one moment.
+    dm_private_overwrites: dict = {}
+    if pc_role:
+        dm_private_overwrites[pc_role] = discord.PermissionOverwrite(view_channel=False, connect=False)
+    if dm_role:
+        dm_private_overwrites[dm_role] = discord.PermissionOverwrite(
+            view_channel=True, connect=True, speak=True, move_members=True,
+        )
+
     text_channel: discord.TextChannel | None = None
     voice_channel: discord.VoiceChannel | None = None
+    dm_private_voice: discord.VoiceChannel | None = None
     extra_channels: list[discord.TextChannel] = []
     try:
         category = await guild.create_category(category_name, overwrites=overwrites)
@@ -511,18 +694,23 @@ async def _run_setup(
         voice_channel = await guild.create_voice_channel(
             "D&D Session", category=category, overwrites=overwrites,
         )
+        dm_private_voice = await guild.create_voice_channel(
+            "DM Private Room", category=category, overwrites=dm_private_overwrites,
+        )
     except discord.Forbidden:
         errors.append("⚠️ Couldn't create channels — grant the bot **Manage Channels** permission.")
 
     # 4. Save config
     cfg: dict = {
-        "session_day": session_day,
         "session_time": session_time,
         "timezone_offset": timezone_offset,
         "min_session_hours": min_session_hours,
         "category_name": category_name,
+        "recurrence_weeks": recurrence_weeks,
         "initialized_at": datetime.utcnow().isoformat(),
     }
+    if not is_poll_mode:
+        cfg["session_day"] = session_day
     if dm_role_id:
         cfg["dm_role_id"] = dm_role_id
     if pc_role_id:
@@ -532,10 +720,48 @@ async def _run_setup(
         cfg["dm_channel_id"] = text_channel.id
     if voice_channel:
         cfg["voice_channel_id"] = voice_channel.id
+    if dm_private_voice:
+        cfg["dm_private_voice_channel_id"] = dm_private_voice.id
     if text_channel:  # category is always created when text_channel is
         cfg["category_id"] = text_channel.category_id
 
+    for day in blocked_day_ints:
+        db.add_campaign_day_block(guild.id, day)
+
+    # 4b. Kick off the first cycle: a fixed day creates the event right away;
+    # "poll" posts a vote immediately and whichever day wins becomes the new default.
+    event_url: str | None = None
+    if is_poll_mode:
+        cfg["current_event_id"] = None
+        cfg["next_cycle_date"] = None
+    else:
+        first_session_date = next_session_date(session_day)
+        helper_cfg = {
+            "voice_channel_id": voice_channel.id if voice_channel else None,
+            "timezone_offset": timezone_offset,
+            "min_session_hours": min_session_hours,
+            "session_time": session_time,
+        }
+        event = await create_scheduled_event_for_day(guild, session_day, first_session_date, helper_cfg)
+        cfg["current_event_id"] = event.id if event else None
+        cfg["next_cycle_date"] = (first_session_date + timedelta(weeks=recurrence_weeks)).isoformat()
+        event_url = event.url if event else None
+        if not event:
+            errors.append(
+                "⚠️ Couldn't create the kickoff event — check the voice channel and the bot's "
+                "**Manage Events** permission. It'll be retried automatically next cycle."
+            )
+
     db.upsert_config(guild.id, **cfg)
+
+    poll_posted = False
+    if is_poll_mode:
+        week = week_start_str()
+        db.create_poll(0, 0, initiated_by, week)
+        msg = await post_new_poll(guild, initiated_by, week)
+        poll_posted = bool(msg)
+        if not poll_posted:
+            errors.append("⚠️ Couldn't post the kickoff poll — check that the poll channel was created.")
 
     # 5. Build summary
     sign = "+" if timezone_offset >= 0 else ""
@@ -545,7 +771,11 @@ async def _run_setup(
     lines.append(f"• {text_channel.mention} — polls & announcements" if text_channel else "• *(channel creation failed)*")
     for ch in extra_channels:
         lines.append(f"• {ch.mention}")
-    lines.append(f"• **{voice_channel.name}** — voice channel for sessions\n" if voice_channel else "• *(voice channel creation failed)*\n")
+    lines.append(f"• **{voice_channel.name}** — voice channel for sessions" if voice_channel else "• *(voice channel creation failed)*")
+    lines.append(
+        f"• **{dm_private_voice.name}** — DM-only private room, invisible to PCs (DM adds/moves players in manually)\n"
+        if dm_private_voice else "• *(DM private room creation failed)*\n"
+    )
 
     lines.append("🎭 **Roles**")
     lines.append(f"• {dm_role.mention} — Dungeon Master" if dm_role else "• *(DM role not configured)*")
@@ -564,9 +794,27 @@ async def _run_setup(
         lines.append("")
 
     lines.append("📅 **Schedule**")
-    lines.append(f"• Session: **{DAY_NAMES[session_day]}s at {session_time}**")
+    if is_poll_mode:
+        lines.append("• Session day: **deciding via poll** — vote below, the winner becomes the default")
+    else:
+        lines.append(f"• Session: **{DAY_NAMES[session_day]}s at {session_time}**")
     lines.append(f"• Timezone: **UTC{sign}{timezone_offset}**")
     lines.append(f"• Min session length: **{min_session_hours}h**")
+    cadence = "every week" if recurrence_weeks == 1 else f"every {recurrence_weeks} weeks"
+    lines.append(f"• Repeats: **{cadence}**")
+    if blocked_day_ints:
+        blocked_names = ", ".join(DAY_NAMES[d] for d in sorted(blocked_day_ints))
+        lines.append(f"• Always blocked: **{blocked_names}**")
+    lines.append("")
+
+    if is_poll_mode:
+        if poll_posted:
+            lines.append("📊 A scheduling poll has been posted in the poll channel — vote for available days!")
+        # else: the warning is already in `errors` below
+    else:
+        if event_url:
+            lines.append(f"📅 First session scheduled: [view event & get notified]({event_url})")
+        lines.append("*(Use `/cantmake` any week to open a poll instead and override this default.)*")
 
     if errors:
         lines += ["", "**Warnings:**"] + errors

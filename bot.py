@@ -44,6 +44,7 @@ COGS = [
     "cogs.admin",
     "cogs.poll",
     "cogs.availability",
+    "cogs.scheduler",
 ]
 
 for cog in COGS:

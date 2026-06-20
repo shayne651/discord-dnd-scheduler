@@ -369,16 +369,79 @@ def remove_day_block(guild_id: int, user_id: int, day_of_week: int) -> bool:
 
 
 def get_blocked_days_for_guild(guild_id: int) -> dict[int, list[str]]:
-    """Returns {day_of_week: [user_id, ...]} for every blocked day in the guild."""
+    """
+    Returns {day_of_week: [user_id, ...]} for every blocked day in the guild.
+    Campaign-wide blocks (set via /blockcampaignday) are merged in under the
+    sentinel user_id "campaign" so callers don't need to know the difference.
+    """
     with get_conn() as conn:
+        campaign_rows = conn.execute(
+            "SELECT day_of_week FROM campaign_day_blocks WHERE guild_id=?",
+            (str(guild_id),),
+        ).fetchall()
         rows = conn.execute(
             "SELECT day_of_week, user_id FROM player_day_blocks WHERE guild_id=?",
             (str(guild_id),),
         ).fetchall()
     result: dict[int, list[str]] = {}
+    for row in campaign_rows:
+        result.setdefault(row["day_of_week"], []).append("campaign")
     for row in rows:
         result.setdefault(row["day_of_week"], []).append(row["user_id"])
     return result
+
+
+# ── campaign_day_blocks ───────────────────────────────────────────────────────
+
+def add_campaign_day_block(guild_id: int, day_of_week: int) -> bool:
+    """Add a campaign-wide day block. Returns True if new, False if already existed."""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM campaign_day_blocks WHERE guild_id=? AND day_of_week=?",
+            (str(guild_id), day_of_week),
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            "INSERT INTO campaign_day_blocks (guild_id, day_of_week) VALUES (?, ?)",
+            (str(guild_id), day_of_week),
+        )
+        return True
+
+
+def remove_campaign_day_block(guild_id: int, day_of_week: int) -> bool:
+    """Remove a campaign-wide day block. Returns True if removed, False if it didn't exist."""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM campaign_day_blocks WHERE guild_id=? AND day_of_week=?",
+            (str(guild_id), day_of_week),
+        ).fetchone()
+        if not existing:
+            return False
+        conn.execute(
+            "DELETE FROM campaign_day_blocks WHERE guild_id=? AND day_of_week=?",
+            (str(guild_id), day_of_week),
+        )
+        return True
+
+
+def get_campaign_blocked_days(guild_id: int) -> list[int]:
+    """Return list of day_of_week ints blocked campaign-wide."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT day_of_week FROM campaign_day_blocks WHERE guild_id=?",
+            (str(guild_id),),
+        ).fetchall()
+    return [r["day_of_week"] for r in rows]
+
+
+def remove_all_votes_for_day(poll_id: int, day_of_week: int) -> None:
+    """Remove every player's vote for a day (used when the day becomes campaign-blocked)."""
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM votes WHERE poll_id=? AND day_of_week=?",
+            (poll_id, day_of_week),
+        )
 
 
 def get_user_day_blocks(guild_id: int, user_id: int) -> list[int]:
@@ -469,12 +532,14 @@ def wipe_campaign_data(guild_id: int) -> None:
         conn.execute("DELETE FROM end_times WHERE guild_id=?", (str(guild_id),))
         conn.execute("DELETE FROM session_history")
         conn.execute("DELETE FROM player_day_blocks WHERE guild_id=?", (str(guild_id),))
+        conn.execute("DELETE FROM campaign_day_blocks WHERE guild_id=?", (str(guild_id),))
         conn.execute("DELETE FROM player_nicknames WHERE guild_id=?", (str(guild_id),))
         conn.execute("DELETE FROM player_timezone_offsets WHERE guild_id=?", (str(guild_id),))
         conn.execute(
             "UPDATE config SET initialized_at=NULL, category_id=NULL, "
             "poll_channel_id=NULL, dm_channel_id=NULL, voice_channel_id=NULL, "
-            "player_role_id=NULL, dm_role_id=NULL WHERE id=1"
+            "player_role_id=NULL, dm_role_id=NULL, next_cycle_date=NULL, "
+            "current_event_id=NULL WHERE id=1"
         )
 
 

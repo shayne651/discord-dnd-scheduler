@@ -113,24 +113,52 @@ Then run `/status` to confirm everything is set.
 | Command | What it does |
 |---|---|
 | `/setschedule Saturday 7pm` | Set the regular session day and start time |
-| `/setday Saturday` | Quick shortcut to change just the session day |
+| `/setday Saturday` | Quick shortcut to change the default session day. If a cycle is currently auto-scheduled (no open poll), its event is moved to match. |
+| `/setrecurrence 2` | Set how often (in weeks) the campaign repeats — `1` for weekly, `2` for every other week, etc. |
+| `/blockcampaignday Friday` | Permanently block a day for the whole campaign (not just one player) — excluded from every poll. |
+| `/unblockcampaignday Friday` | Remove a campaign-wide day block. |
 | `/setchannel` | Set the poll or DM notification channel |
+| `/setvoicechannel` | Set the voice channel used for the regular session's Discord Scheduled Event |
+| `/setdmprivatevoice` | Set the private voice channel for pulling players aside (see below) |
 | `/setrole` | Set the player role |
 | `/setdmrole` | Set the DM role |
+| `/startpoll` | Manually open a poll for this week, overriding any auto-scheduled event for the current cycle |
 | `/resetpoll` | Cancel and delete the current poll |
-| `/wipe` | **End-of-campaign reset** — removes player/DM roles from all members, clears all session data, votes, day blocks, and character names. Shows a confirmation prompt first. |
-| `/status` | Show current configuration, session schedule, and active day blocks |
+| `/wipe` | **End-of-campaign reset** — removes player/DM roles from all members, clears all session data, votes, day blocks, character names, and cancels any pending auto-scheduled event. Shows a confirmation prompt first. |
+| `/status` | Show current configuration, session schedule, recurrence, campaign-wide and per-player blocked days |
+
+---
+
+## DM private room
+
+`/init` creates a second voice channel — **DM Private Room** — alongside the main session voice channel. PCs can't see or join it; only the DM role can. Use it to pull one player (or a few) aside without the rest of the table hearing, e.g. a private conversation when something happens to their character.
+
+To get someone in there, either:
+- **Move them**: right-click their name while they're in the main voice channel → **Move To** → DM Private Room (works even though they don't have Connect on it, since the DM role has **Move Members**), or
+- **Grant them temporary access**: add a per-member permission overwrite on the channel in Server Settings, then remove it after.
+
+If you ever need to repoint it (e.g. you recreated the channel manually), use `/setdmprivatevoice`.
 
 ---
 
 ## How scheduling works
 
-1. A player runs `/cantmake` and picks which days they're free
-2. A poll appears in the poll channel — everyone (including the DM) clicks every day that works for them
-3. **When a day gets votes from every player:** the poll closes and that day is announced
-4. **If multiple days work for everyone:** a tiebreaker poll runs — most votes wins
-5. **If someone clicks "No days work for me":** they're asked to confirm, then the poll closes and everyone is notified D&D is off this week
-6. **If everyone votes but no day has consensus:** the bot nudges everyone to vote for more days
+### Default cadence (no action needed)
+
+The campaign has a **default day** and a **recurrence** (how often, in weeks, it repeats — set during `/init` or via `/setrecurrence`). Every cycle, the bot automatically creates the Discord Scheduled Event for the default day with no polling required, then queues up the next cycle.
+
+- During `/init`, you either pick a fixed day (the first event is created immediately) or type `poll` (a poll is posted immediately instead, and the winning day becomes the new default).
+- `/setday` changes the default day going forward (and moves any already-scheduled event to match).
+- Campaign-wide blocked days (`/blockcampaignday`) and per-player blocks (`/blockday`) are always excluded.
+
+### Overriding a cycle with a poll
+
+1. A player runs `/cantmake` and picks which days they're free (or the DM runs `/startpoll`). This cancels any auto-scheduled event for the current cycle and opens a poll instead.
+2. A poll appears in the poll channel — everyone (including the DM) clicks every day that works for them.
+3. **When a day gets votes from every player:** the poll closes, that day is announced and **becomes the new default day** for future cycles.
+4. **If multiple days work for everyone:** a tiebreaker poll runs — most votes wins.
+5. **If someone clicks "No days work for me":** they're asked to confirm, then the poll closes and everyone is notified D&D is off this week — the next cycle is still queued up per the recurrence cadence.
+6. **If everyone votes but no day has consensus:** the bot nudges everyone to vote for more days.
 
 ---
 
