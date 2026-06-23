@@ -13,6 +13,7 @@ separated audio and hands the files off.
 
 import json
 import re
+import traceback
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,6 +119,9 @@ class SessionCog(commands.Cog):
 
         def after(error: Exception | None):
             state["reader_error"] = error
+            if error is not None:
+                print(f"[Session] Recording stopped early with error: {error!r}")
+                traceback.print_exception(type(error), error, error.__traceback__)
 
         sink = discord.sinks.WaveSink()
         try:
@@ -163,7 +167,9 @@ class SessionCog(commands.Cog):
             print(f"[Session] stop_recording failed: {e}")
 
         if state.get("reader_error"):
-            print(f"[Session] Audio reader reported an error: {state['reader_error']}")
+            err = state["reader_error"]
+            print(f"[Session] Audio reader reported an error: {err!r}")
+            traceback.print_exception(type(err), err, err.__traceback__)
 
         try:
             folder = self._session_folder(guild_id, session_number, started_at)
