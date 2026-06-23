@@ -33,6 +33,16 @@ PCM_SAMPLE_RATE = 48000
 PCM_CHANNELS = 2
 PCM_SAMPLE_WIDTH = 2  # bytes
 
+# py-cord 2.8's voice-receive rewrite added a SinkEventRouter that expects every
+# Sink to define __sink_listeners__/walk_children(), but the legacy Sink/WaveSink
+# classes we use were never updated with them — start_recording() raises
+# AttributeError before any audio capture starts. WaveSink never dispatches sink
+# events, so it's safe to fill these in as empty. Drop this once pycord ships a fix
+# for https://github.com/Pycord-Development/pycord/issues/3139.
+if not hasattr(discord.sinks.Sink, "__sink_listeners__"):
+    discord.sinks.Sink.__sink_listeners__ = ()
+    discord.sinks.Sink.walk_children = lambda self: ()
+
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", name) or "unknown"
