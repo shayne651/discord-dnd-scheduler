@@ -46,6 +46,19 @@ if not hasattr(discord.sinks.Sink, "__sink_listeners__"):
     discord.sinks.Sink.walk_children = lambda self: ()
     discord.sinks.Sink.is_opus = lambda self: False
 
+    # PacketRouter._do_run() calls sink.write(data, data.source) with a VoiceData
+    # wrapper and a Member, but legacy Sink.write(self, data, user) expects raw PCM
+    # bytes and an int user id — it writes `data` straight into a BytesIO and keys
+    # audio_data on `user`. Unwrap both before delegating to the original write.
+    _original_sink_write = discord.sinks.Sink.write
+
+    def _patched_sink_write(self, data, user):
+        pcm = getattr(data, "pcm", data)
+        user_id = getattr(user, "id", user)
+        return _original_sink_write(self, pcm, user_id)
+
+    discord.sinks.Sink.write = _patched_sink_write
+
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", name) or "unknown"
