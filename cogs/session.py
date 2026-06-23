@@ -24,6 +24,7 @@ from discord.ext import commands
 
 import config
 import database as db
+from discord.voice.state import VoiceConnectionState
 from utils.messages import (
     session_already_recording, session_ended_summary, session_error_voice_connect,
     session_no_voice_channel, session_not_recording, session_started, session_stopping,
@@ -33,6 +34,20 @@ from utils.messages import (
 PCM_SAMPLE_RATE = 48000
 PCM_CHANNELS = 2
 PCM_SAMPLE_WIDTH = 2  # bytes
+
+# Force the bot to advertise *no* DAVE (E2EE) support so Discord downgrades the
+# whole voice channel to transport-only encryption. E2EE is only used when every
+# participant supports it, so a single peer reporting max version 0 disables it
+# for the channel. py-cord negotiates DAVE automatically whenever `davey` is
+# installed — and py-cord[voice] makes davey a hard requirement (discord.voice
+# refuses to import without it), so we can't opt out by dropping the dependency.
+# With DAVE active, py-cord's E2EE decrypt path yields frames the opus decoder
+# rejects ("corrupted stream"), so every received packet is dropped and the sink
+# ends up empty — i.e. no recordings. `max_dave_proto_version` is read only when
+# the voice IDENTIFY is sent, so overriding it before any connection is enough.
+# Drop once pycord fixes voice receive under DAVE:
+# https://github.com/Pycord-Development/pycord/issues/3139.
+VoiceConnectionState.max_dave_proto_version = property(lambda self: 0)
 
 # py-cord 2.8's voice-receive rewrite added a SinkEventRouter/PacketDecoder that
 # expect every Sink to define __sink_listeners__, walk_children(), and is_opus(),
