@@ -143,3 +143,49 @@ def schedule_set(day_name: str, time_str: str | None) -> str:
     if time_str:
         return f"✅ Regular session set to **{day_name}s at {time_str}**."
     return f"✅ Regular session day set to **{day_name}s**."
+
+
+# ── session recording ────────────────────────────────────────────────────────
+
+def session_no_voice_channel() -> str:
+    return (
+        "⚠️ No session voice channel is configured yet. "
+        "Ask the DM to run `/setvoicechannel` first."
+    )
+
+
+def session_already_recording() -> str:
+    return "⚠️ A session recording is already in progress. Use `/session end` to stop it."
+
+
+def session_not_recording() -> str:
+    return "There's no active recording to end."
+
+
+def session_started(channel_name: str, session_number: int) -> str:
+    return f"🔴 **Recording session #{session_number}** in **#{channel_name}**. Use `/session end` when you're done."
+
+
+def session_stopping() -> str:
+    return "⏳ Stopping recording and saving files..."
+
+
+def session_ended_summary(
+    session_number: int, speaker_count: int, duration_str: str, webhook_ok: bool | None
+) -> str:
+    msg = (
+        f"✅ **Session #{session_number} recording saved** — "
+        f"{speaker_count} speaker file(s), {duration_str}."
+    )
+    if webhook_ok is True:
+        msg += "\nTranscription service notified."
+    elif webhook_ok is False:
+        msg += "\n⚠️ Couldn't notify the transcription service — you'll need to trigger it manually."
+    return msg
+
+
+def session_error_voice_connect() -> str:
+    return (
+        "⚠️ Couldn't join or record the voice channel. This is most likely a Discord "
+        "voice/encryption issue on the bot's end — check the bot logs for details."
+    )

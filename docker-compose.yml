@@ -5,3 +5,4 @@ services:
     env_file: .env
     volumes:
       - ./dnd_schedule.db:/app/dnd_schedule.db
+      - ./recordings:/app/recordings

@@ -38,6 +38,11 @@ SESSION_DAY: str    = _optional("SESSION_DAY", "Saturday")
 PLAYER_ROLE_NAME: str = _optional("PLAYER_ROLE_NAME", "DnD Player")
 DM_ROLE_NAME: str   = _optional("DM_ROLE_NAME", "Dungeon Master")
 
+# ── /session start /session end (voice recording) ──────────────────────────
+RECORDINGS_DIR: str = _optional("RECORDINGS_DIR", "recordings")
+TRANSCRIBE_WEBHOOK_URL: str = _optional("TRANSCRIBE_WEBHOOK_URL", "")
+TRANSCRIBE_WEBHOOK_SECRET: str = _optional("TRANSCRIBE_WEBHOOK_SECRET", "")
+
 # ── Day-name → weekday int mapping (Python: Mon=0 … Sun=6) ─────────────────
 DAY_NAME_TO_INT: dict[str, int] = {
     "Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3,

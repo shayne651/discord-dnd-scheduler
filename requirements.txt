@@ -1,2 +1,4 @@
-py-cord>=2.6.0
+py-cord[voice]>=2.8.0
+davey
+aiohttp
 python-dotenv>=1.0.0

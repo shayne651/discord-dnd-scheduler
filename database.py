@@ -559,3 +559,58 @@ def record_history(
                VALUES (?, ?, ?, ?, ?)""",
             (week_start, original_day, rescheduled_to, int(cancelled), reason),
         )
+
+
+# ── session_recordings ────────────────────────────────────────────────────────
+
+def start_session_recording(guild_id: int, channel_id: int, started_by: int) -> tuple[int, int]:
+    """Create a new 'recording' row. Returns (id, session_number); session_number auto-increments per guild."""
+    with get_conn() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM session_recordings WHERE guild_id=?",
+            (str(guild_id),),
+        ).fetchone()["n"]
+        session_number = count + 1
+        cur = conn.execute(
+            """INSERT INTO session_recordings (guild_id, channel_id, session_number, started_by)
+               VALUES (?, ?, ?, ?)""",
+            (str(guild_id), str(channel_id), session_number, str(started_by)),
+        )
+        return cur.lastrowid, session_number
+
+
+def get_active_session_recording(guild_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM session_recordings WHERE guild_id=? AND status='recording'",
+            (str(guild_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def complete_session_recording(session_id: int, folder_path: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE session_recordings
+               SET status='completed', ended_at=datetime('now'), folder_path=?
+               WHERE id=?""",
+            (folder_path, session_id),
+        )
+
+
+def fail_session_recording(session_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE session_recordings SET status='failed', ended_at=datetime('now') WHERE id=?",
+            (session_id,),
+        )
+
+
+def fail_stale_session_recordings() -> int:
+    """Mark any still-'recording' rows as 'failed' (called on bot startup, since
+    in-memory voice/sink state can't survive a restart). Returns rows affected."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE session_recordings SET status='failed', ended_at=datetime('now') WHERE status='recording'"
+        )
+        return cur.rowcount

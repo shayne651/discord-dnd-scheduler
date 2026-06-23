@@ -9,9 +9,11 @@ import config
 import database as db
 
 # ── Intents ────────────────────────────────────────────────────────────────────
-# We need Members intent to fetch role members for consensus detection.
+# We need Members intent to fetch role members for consensus detection, and
+# Voice States to join/track voice channels for /session recording.
 intents = discord.Intents.default()
 intents.members = True
+intents.voice_states = True
 
 bot = discord.Bot(intents=intents)
 
@@ -31,6 +33,13 @@ async def on_ready():
         seed["dm_channel_id"] = config.DM_NOTIFY_CHANNEL_ID
     db.upsert_config(config.GUILD_ID, **seed)
 
+    # Any recording still marked "recording" couldn't have survived a restart
+    # (the in-memory voice client/sink is gone) — mark it failed so
+    # /session start isn't blocked forever.
+    stale = db.fail_stale_session_recordings()
+    if stale:
+        print(f"[Bot] Marked {stale} stale session recording(s) as failed.")
+
     # Sync slash commands to the specific guild for instant availability
     # (global sync can take up to an hour)
     await bot.sync_commands(guild_ids=[config.GUILD_ID])
@@ -45,6 +54,7 @@ COGS = [
     "cogs.poll",
     "cogs.availability",
     "cogs.scheduler",
+    "cogs.session",
 ]
 
 for cog in COGS:
