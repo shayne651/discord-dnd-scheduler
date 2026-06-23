@@ -124,6 +124,10 @@ class SessionCog(commands.Cog):
                 traceback.print_exception(type(error), error, error.__traceback__)
 
         sink = discord.sinks.WaveSink()
+        # The new packet router asserts sink.client (-> sink.vc) on every packet, but
+        # nothing in pycord 2.8's rewrite calls the legacy Sink.init(vc) hook that used
+        # to set it — wire it up ourselves before any packets can arrive.
+        sink.vc = vc
         try:
             vc.start_recording(sink, after)
         except Exception as e:
