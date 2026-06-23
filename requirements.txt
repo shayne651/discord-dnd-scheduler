@@ -1,4 +1,11 @@
-py-cord[voice]>=2.8.0
+# Voice reception (recording) is broken under Discord's now-mandatory DAVE/E2EE
+# in released py-cord (<=2.8.x): packets are opus-decoded before the DAVE layer is
+# stripped, so every frame fails with OpusError('corrupted stream') and nothing is
+# captured. PR #3159 reorders this (DAVE-decrypt -> opus-decode) and is confirmed
+# working; it's slated for 2.9.0. Pinned to the PR's commit until 2.9.0 ships, then
+# move back to a released `py-cord[voice]>=2.9.0`.
+# Tracking: https://github.com/Pycord-Development/pycord/issues/3139
+py-cord[voice] @ git+https://github.com/Pycord-Development/pycord@05cf65fa6d81567a8a4347ac961a093981554137
 davey
 aiohttp
 python-dotenv>=1.0.0

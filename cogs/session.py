@@ -24,7 +24,6 @@ from discord.ext import commands
 
 import config
 import database as db
-from discord.voice.state import VoiceConnectionState
 from utils.messages import (
     session_already_recording, session_ended_summary, session_error_voice_connect,
     session_no_voice_channel, session_not_recording, session_started, session_stopping,
@@ -34,20 +33,6 @@ from utils.messages import (
 PCM_SAMPLE_RATE = 48000
 PCM_CHANNELS = 2
 PCM_SAMPLE_WIDTH = 2  # bytes
-
-# Force the bot to advertise *no* DAVE (E2EE) support so Discord downgrades the
-# whole voice channel to transport-only encryption. E2EE is only used when every
-# participant supports it, so a single peer reporting max version 0 disables it
-# for the channel. py-cord negotiates DAVE automatically whenever `davey` is
-# installed — and py-cord[voice] makes davey a hard requirement (discord.voice
-# refuses to import without it), so we can't opt out by dropping the dependency.
-# With DAVE active, py-cord's E2EE decrypt path yields frames the opus decoder
-# rejects ("corrupted stream"), so every received packet is dropped and the sink
-# ends up empty — i.e. no recordings. `max_dave_proto_version` is read only when
-# the voice IDENTIFY is sent, so overriding it before any connection is enough.
-# Drop once pycord fixes voice receive under DAVE:
-# https://github.com/Pycord-Development/pycord/issues/3139.
-VoiceConnectionState.max_dave_proto_version = property(lambda self: 0)
 
 # py-cord 2.8's voice-receive rewrite added a SinkEventRouter/PacketDecoder that
 # expect every Sink to define __sink_listeners__, walk_children(), and is_opus(),
@@ -232,9 +217,17 @@ class SessionCog(commands.Cog):
 
     def _write_speaker_files(self, sink, guild: discord.Guild, folder: Path) -> list[dict]:
         files_meta = []
-        for user_id, audio_data in sink.audio_data.items():
-            member = guild.get_member(user_id)
-            display_name = member.display_name if member else f"user-{user_id}"
+        # py-cord keys audio_data by the resolved User/Member emitting the audio
+        # (or None if it couldn't resolve the ssrc -> user). Older builds keyed it
+        # by the raw int user id, so accept both.
+        for user, audio_data in sink.audio_data.items():
+            user_id = getattr(user, "id", user)
+            member = guild.get_member(user_id) if isinstance(user_id, int) else None
+            display_name = (
+                getattr(user, "display_name", None)
+                or getattr(member, "display_name", None)
+                or f"user-{user_id}"
+            )
 
             buf = audio_data.file
             buf.seek(0)
